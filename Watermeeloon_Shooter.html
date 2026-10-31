@@ -1,0 +1,658 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>FPS Maze v17 — Rotating Minimap</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#bde9ff;font-family:Arial,sans-serif;color:#fff}
+canvas{display:block;width:100%;height:100%;cursor:crosshair}
+#hud{position:fixed;z-index:5;top:16px;left:18px;font-size:20px;font-weight:bold;text-shadow:0 2px 4px #000;pointer-events:none}
+#hud span{margin-right:25px}
+#menu{position:fixed;z-index:6;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.10);pointer-events:none}
+#card{background:rgba(35,85,120,.88);border:1px solid #777;border-radius:16px;padding:25px 32px;text-align:center;max-width:520px}
+#title{font-size:30px;font-weight:900;margin-bottom:10px}
+#sub{line-height:1.6}
+#status{position:fixed;z-index:7;left:50%;bottom:18px;transform:translateX(-50%);background:rgba(0,0,0,.65);padding:9px 14px;border-radius:9px;font-size:14px;pointer-events:none;white-space:nowrap}
+.hitDir{position:fixed;z-index:9;display:none;font-size:25px;font-weight:900;color:#ff5656;
+text-shadow:0 2px 5px #000;pointer-events:none;background:rgba(80,0,0,.42);padding:8px 13px;border-radius:9px}
+.hitFront{left:50%;top:14%;transform:translateX(-50%)}
+.hitBack{left:50%;bottom:14%;transform:translateX(-50%)}
+.hitLeft{left:5%;top:50%;transform:translateY(-50%)}
+.hitRight{right:5%;top:50%;transform:translateY(-50%)}
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0"></canvas>
+<div id="hud"><span>❤️ <b id="hp">100</b></span><span>🔫 <b id="ammo">15</b>/15</span><span>💀 <b id="kills">0</b></span><span>🎥 <b id="viewMode">3RD PERSON</b></span></div>
+<div id="menu"><div id="card"><div id="title">FIND THE EXIT!</div><div id="sub">Find the glowing EXIT — there are multiple routes, loops, dead ends, and more enemies!<br>WASD = move &nbsp; • &nbsp; Mouse = look<br>Click = shoot &nbsp; • &nbsp; Hold RIGHT CLICK = LOCK ON &nbsp; • &nbsp; A/D = strafe target &nbsp; • &nbsp; R = reload &nbsp; • &nbsp; V = switch view &nbsp; • &nbsp; ESC = unlock</div></div></div>
+<div id="status">WebGL2 + WASM hybrid • Cursor unlocked — click anywhere on the game.</div>
+<div id="hitFront" class="hitDir hitFront">▲ FRONT</div>
+<div id="hitBack" class="hitDir hitBack">▼ BACK</div>
+<div id="hitLeft" class="hitDir hitLeft">◀ LEFT</div>
+<div id="hitRight" class="hitDir hitRight">RIGHT ▶</div><div id="reloadOverlay" style="display:none;position:fixed;z-index:8;left:50%;top:62%;transform:translate(-50%,-50%);background:rgba(0,0,0,.72);padding:12px 20px;border-radius:10px;font-size:22px;font-weight:900;pointer-events:none">RELOADING... 3.0s</div>
+<script>
+'use strict';
+(()=>{
+const canvas=document.getElementById('game');
+const gl=canvas.getContext('webgl2',{alpha:false,antialias:false});
+const surface=document.createElement('canvas');
+const ctx=surface.getContext('2d',{alpha:false});
+let gpu=null;
+if(gl){
+ const compile=(type,source)=>{const sh=gl.createShader(type);gl.shaderSource(sh,source);gl.compileShader(sh);if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(sh));return sh;};
+ const vs=compile(gl.VERTEX_SHADER,`#version 300 es
+precision highp float;
+out vec2 uv;
+void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);uv=vec2(p.x,1.0-p.y);gl_Position=vec4(p*2.0-1.0,0,1);}`);
+ const fs=compile(gl.FRAGMENT_SHADER,`#version 300 es
+precision highp float;
+in vec2 uv;uniform sampler2D scene;out vec4 color;void main(){color=texture(scene,uv);}`);
+ const program=gl.createProgram();gl.attachShader(program,vs);gl.attachShader(program,fs);gl.linkProgram(program);
+ if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));
+ const texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,texture);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+ gl.useProgram(program);gl.uniform1i(gl.getUniformLocation(program,'scene'),0);gpu={program,texture};
+}
+function present(){if(!gpu)return;gl.viewport(0,0,canvas.width,canvas.height);gl.bindTexture(gl.TEXTURE_2D,gpu.texture);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,surface);gl.drawArrays(gl.TRIANGLES,0,3);}
+
+const menu=document.getElementById('menu');
+const title=document.getElementById('title');
+const sub=document.getElementById('sub');
+const status=document.getElementById('status');
+const hpEl=document.getElementById('hp'), ammoEl=document.getElementById('ammo'), killsEl=document.getElementById('kills'), viewModeEl=document.getElementById('viewMode'); const reloadOverlay=document.getElementById('reloadOverlay');
+const hitEls={
+ front:document.getElementById('hitFront'),
+ back:document.getElementById('hitBack'),
+ left:document.getElementById('hitLeft'),
+ right:document.getElementById('hitRight')
+};
+let hitTimers={front:0,back:0,left:0,right:0};
+
+let W=innerWidth,H=innerHeight,DPR=Math.min(devicePixelRatio||1,2); let reloading=false,reloadTime=0;
+function resize(){
+ W=innerWidth;H=innerHeight;DPR=Math.min(devicePixelRatio||1,2);
+ canvas.width=Math.round(W*DPR);canvas.height=Math.round(H*DPR);
+ canvas.style.width=W+'px';canvas.style.height=H+'px';
+ surface.width=canvas.width;surface.height=canvas.height;ctx.setTransform(DPR,0,0,DPR,0,0);ctx.imageSmoothingEnabled=true;
+}
+addEventListener('resize',resize);resize();
+
+// Embedded compiled WebAssembly ray tracing kernel; no external files or server required.
+const WASM_BASE64='AGFzbQEAAAABDgJgAAF/YAZ9fX9/f30AAwUEAAAAAQQFAXABAQEFAwEAAgYIAX8BQYCQBwsHMQUGbWVtb3J5AgAHbWFwX3B0cgAACHJheXNfcHRyAAEHb3V0X3B0cgACBXRyYWNlAAMKrwIECABBgIiAgAALCABBgJCAgAALCABBgJCCgAALkQIDAn8EfQJ/AkAgAkEBSA0AIAJBgCAgAkGAIEgbIQZBACEHA0AgB0EDdCICQYSQgIAAaioCACEIIAJBgJCAgABqKgIAIQlDAAAAACEKAkADQCAKIAVdRQ0BAkACQCAJIApDbxKDPJIiCpQgAJIiC4tDAAAAT11FDQAgC6ghAgwBC0GAgICAeCECCyACIANOIQwCQAJAIAggCpQgAZIiC4tDAAAAT11FDQAgC6ghDQwBC0GAgICAeCENCyAMDQEgAkEASA0BIA1BAEgNASANIARODQEgDSADbCACakGAiICAAGotAABFDQALCyAHQQJ0QYCQgoAAaiAKIAUgCiAFXRs4AgAgB0EBaiIHIAZHDQALCwsASwRuYW1lAAoJcmF5cy53YXNtASQEAAdtYXBfcHRyAQhyYXlzX3B0cgIHb3V0X3B0cgMFdHJhY2UHEgEAD19fc3RhY2tfcG9pbnRlcgB/CXByb2R1Y2VycwEMcHJvY2Vzc2VkLWJ5AQVjbGFuZ18xNy4wLjAgKGh0dHBzOi8vZ2l0aHViLmNvbS9zd2lmdGxhbmcvbGx2bS1wcm9qZWN0LmdpdCAxMDk5OWI2ZDAzNGZlMzE4ZjNkNTZjODNiZGRiNjU3MjU5M2E4YmIwKQBJD3RhcmdldF9mZWF0dXJlcwQrCm11bHRpdmFsdWUrD211dGFibGUtZ2xvYmFscysPcmVmZXJlbmNlLXR5cGVzKwhzaWduLWV4dA==';
+let wasm=null,wasmDirs=null,wasmOut=null;
+const MAP=[
+'1111111111111111111111111111111',
+'1000001000000000100000000000001',
+'1111101111101010111111111011001',
+'1000100000001010000000000010001',
+'1100111111111011111111111010111',
+'1000001000000000101000000010101',
+'1010111011101100101010111010001',
+'1000000000100000101010000000101',
+'1011111011101011100011111101101',
+'1010000000001000001000001000001',
+'1010110010101010001011101011101',
+'1000100010100010000000100000101',
+'1100001110101011001111110110101',
+'1000100000101010001000000010001',
+'1011101011101010111010101111001',
+'1010001010001000100000100010001',
+'1010001010001111101110101000111',
+'1000101000000000001000100010101',
+'1101101011101111100000101110001',
+'1000001000101000001000000010001',
+'1110101110101011111110111010101',
+'1000101010000000000000001000101',
+'1010100011101011101101101101101',
+'1010100000100000000000000000001',
+'1011111010101110101011111010101',
+'1000000010000010101000000000001',
+'1011101110101010001011110010111',
+'1010100000000000101000000010101',
+'1010111010101011100010011010101',
+'1000001000000010000010000000001',
+'1111111111111111111111111111111'
+];
+const BASE_FOV=Math.PI/5, AIM_FOV=Math.PI/6, MAX_DIST=28, PLAYER_RADIUS=.23; // 36° normal, 30° lock-on view
+let player, enemies, keys={}, spawnTimer, muzzle=0, last=performance.now(), gameOver=false,won=false,thirdPerson=true,pitch=0,aiming=false,lockedTarget=null;
+
+function isWall(px,py){
+ const mx=Math.floor(px),my=Math.floor(py);
+ return my<0||my>=MAP.length||mx<0||mx>=MAP[0].length||MAP[my][mx]==='1';
+}
+function blocked(px,py){
+ const r=PLAYER_RADIUS;
+ return isWall(px-r,py-r)||isWall(px+r,py-r)||isWall(px-r,py+r)||isWall(px+r,py+r)||
+        isWall(px-r,py)||isWall(px+r,py)||isWall(px,py-r)||isWall(px,py+r);
+}
+function reset(){
+ player={x:1.5,y:1.5,a:0,hp:100,ammo:15,kills:0,cool:0};
+ enemies=[];spawnTimer=1.2;muzzle=0;gameOver=false;won=false;keys={};pitch=0;aiming=false;lockedTarget=null;reloading=false;reloadTime=0;reloadOverlay.style.display='none';
+ Object.keys(hitTimers).forEach(k=>{hitTimers[k]=0;hitEls[k].style.display='none';});
+ hud();
+ title.textContent='FIND THE EXIT!';
+ sub.innerHTML='Find the glowing EXIT — there are multiple routes, loops, dead ends, and more enemies!<br>WASD = move &nbsp; • &nbsp; Mouse = look<br>Click = shoot &nbsp; • &nbsp; Hold RIGHT CLICK = LOCK ON &nbsp; • &nbsp; A/D = strafe target &nbsp; • &nbsp; R = reload &nbsp; • &nbsp; V = switch view &nbsp; • &nbsp; ESC = unlock';
+ menu.style.display='flex';
+}
+function hud(){hpEl.textContent=Math.max(0,Math.ceil(player.hp));ammoEl.textContent=player.ammo;killsEl.textContent=player.kills;viewModeEl.textContent=thirdPerson?'3RD PERSON':'1ST PERSON'}
+async function initWasm(){
+ try{
+  const bytes=Uint8Array.from(atob(WASM_BASE64),c=>c.charCodeAt(0));
+  const {instance}=await WebAssembly.instantiate(bytes,{});
+  const ex=instance.exports,mem=ex.memory.buffer;
+  const grid=new Uint8Array(mem,ex.map_ptr(),1024);
+  MAP.forEach((row,y)=>{for(let x=0;x<row.length;x++)grid[y*MAP[0].length+x]=row.charCodeAt(x)===49?1:0;});
+  wasm=ex;wasmDirs=new Float32Array(mem,ex.rays_ptr(),8192);wasmOut=new Float32Array(mem,ex.out_ptr(),4096);
+ }catch(e){console.warn('WASM unavailable, using JavaScript fallback',e);}
+}
+initWasm();
+function castRay(a){
+ const ca=Math.cos(a),sa=Math.sin(a);let d=0;
+ while(d<MAX_DIST){d+=.016;if(isWall(player.x+ca*d,player.y+sa*d))return d}
+ return MAX_DIST;
+}
+function spawnEnemy(){
+ for(let n=0;n<120;n++){
+  const ex=1.3+Math.random()*(MAP[0].length-2.6),ey=1.3+Math.random()*(MAP.length-2.6);
+  if(!blocked(ex,ey)&&Math.hypot(ex-player.x,ey-player.y)>5){enemies.push({x:ex,y:ey,hp:2,hit:0,attackCool:0});return}
+ }
+}
+function movePlayer(dx,dy){
+ const steps=Math.max(1,Math.ceil(Math.hypot(dx,dy)/.025)),sx=dx/steps,sy=dy/steps;
+ for(let i=0;i<steps;i++){
+  const nx=player.x+sx;if(!blocked(nx,player.y))player.x=nx;
+  const ny=player.y+sy;if(!blocked(player.x,ny))player.y=ny;
+ }
+}
+function angDiff(target,current){
+ return Math.atan2(Math.sin(target-current),Math.cos(target-current));
+}
+function targetLineClear(e){
+ if(!e)return false;
+ const dx=e.x-player.x,dy=e.y-player.y,d=Math.hypot(dx,dy);
+ const a=Math.atan2(dy,dx);
+ return d < castRay(a)+.32;
+}
+function findLockTarget(){
+ let best=null,bestScore=1e9;
+ for(const e of enemies){
+  const dx=e.x-player.x,dy=e.y-player.y,d=Math.hypot(dx,dy);
+  if(d>17)continue;
+  const a=Math.atan2(dy,dx);
+  const diff=Math.abs(angDiff(a,player.a));
+  // Very forgiving acquisition cone: roughly point toward a watermelon
+  // and the lock-on system grabs the best visible target.
+  if(diff>Math.PI*.34)continue;
+  if(!targetLineClear(e))continue;
+  const score=diff*5+d*.045;
+  if(score<bestScore){best=e;bestScore=score}
+ }
+ return best;
+}
+function updateTargetLock(dt){
+ if(!aiming){lockedTarget=null;return}
+ if(!lockedTarget || !enemies.includes(lockedTarget) || lockedTarget.hp<=0 ||
+    Math.hypot(lockedTarget.x-player.x,lockedTarget.y-player.y)>18 || !targetLineClear(lockedTarget)){
+  lockedTarget=findLockTarget();
+ }
+ if(lockedTarget){
+  if(status.textContent.startsWith('🎯 LOCK-ON SEARCHING'))status.textContent='🔒 WATERMELON LOCKED — A/D to strafe';
+  const targetA=Math.atan2(lockedTarget.y-player.y,lockedTarget.x-player.x);
+  const diff=angDiff(targetA,player.a);
+  // Smooth but strong camera tracking, like an action-game target lock.
+  player.a += diff*Math.min(1,dt*15);
+  if(thirdPerson){
+   pitch *= Math.max(0,1-dt*8);
+  }
+ }
+}
+function shoot(){
+ if(document.pointerLockElement!==canvas||gameOver||player.cool>0||reloading)return;
+ if(player.ammo<=0){status.textContent='Out of ammo — press R to reload';return}
+ player.ammo--;player.cool=.14;muzzle=.065;
+ const viewFov=aiming?AIM_FOV:BASE_FOV;
+ let hit=null,best=Infinity;
+
+ // LOCK-ON SHOT: if a target is locked and visible, the shot goes to it.
+ // This is deliberately forgiving so aiming feels like an action-adventure lock-on system.
+ if(aiming&&lockedTarget&&targetLineClear(lockedTarget)){
+  hit=lockedTarget;
+ }else{
+  for(const e of enemies){
+   const dx=e.x-player.x,dy=e.y-player.y,d=Math.hypot(dx,dy);
+   let da=Math.atan2(dy,dx)-player.a;da=Math.atan2(Math.sin(da),Math.cos(da));
+   if(Math.abs(da)>viewFov*.68)continue;
+   const screenX=W/2+(da/(viewFov/2))*W/2;
+   const spriteSize=Math.min(H,400/Math.max(.001,d));
+   // Slightly larger normal-fire aim assist too.
+   const hitRadius=Math.max(15,spriteSize*.40);
+   const clearShot=d<castRay(player.a+da)+.32;
+   if(Math.abs(screenX-W/2)<=hitRadius&&clearShot&&d<best){hit=e;best=d}
+  }
+ }
+
+ if(hit){
+  hit.hp--;hit.hit=.09;
+  if(hit.hp<=0){
+   player.kills++;
+   if(hit===lockedTarget)lockedTarget=null;
+  }
+ }
+ enemies=enemies.filter(e=>e.hp>0);hud();
+}
+function showHitDirection(enemy){
+ const dx=enemy.x-player.x,dy=enemy.y-player.y;
+ let rel=Math.atan2(dy,dx)-player.a;
+ rel=Math.atan2(Math.sin(rel),Math.cos(rel));
+ let dir;
+ if(Math.abs(rel)<=Math.PI/4) dir='front';
+ else if(Math.abs(rel)>=Math.PI*3/4) dir='back';
+ else if(rel<0) dir='left';
+ else dir='right';
+ hitTimers[dir]=0.55;
+ hitEls[dir].style.display='block';
+}
+function update(dt){
+ player.cool=Math.max(0,player.cool-dt);muzzle=Math.max(0,muzzle-dt);
+ updateTargetLock(dt);
+ for(const k of Object.keys(hitTimers)){
+  if(hitTimers[k]>0){hitTimers[k]-=dt;if(hitTimers[k]<=0)hitEls[k].style.display='none';}
+ } if(reloading){reloadTime-=dt;reloadOverlay.textContent='RELOADING... '+Math.max(0,reloadTime).toFixed(1)+'s';if(reloadTime<=0){reloading=false;reloadTime=0;player.ammo=15;reloadOverlay.style.display='none';hud();status.textContent='Reload complete!';}}
+ let dx=0,dy=0;
+ if(keys.KeyW){dx+=Math.cos(player.a);dy+=Math.sin(player.a)}
+ if(keys.KeyS){dx-=Math.cos(player.a);dy-=Math.sin(player.a)}
+ if(keys.KeyA){dx+=Math.cos(player.a-Math.PI/2);dy+=Math.sin(player.a-Math.PI/2)}
+ if(keys.KeyD){dx+=Math.cos(player.a+Math.PI/2);dy+=Math.sin(player.a+Math.PI/2)}
+ const len=Math.hypot(dx,dy);if(len){const moveSpeed=(aiming&&lockedTarget)?2.35:3;movePlayer(dx/len*moveSpeed*dt,dy/len*moveSpeed*dt);}
+ spawnTimer-=dt;
+ if(spawnTimer<=0&&enemies.length<10){spawnEnemy();spawnTimer=1.8}
+ for(const e of enemies){
+  e.hit=Math.max(0,e.hit-dt);e.attackCool=Math.max(0,(e.attackCool||0)-dt);
+  const dx=player.x-e.x,dy=player.y-e.y,d=Math.hypot(dx,dy)||1;
+  if(d>.62){
+   const speed=.72+Math.min(player.kills*.012,.48),mx=dx/d*speed*dt,my=dy/d*speed*dt;
+   if(!isWall(e.x+mx,e.y))e.x+=mx;if(!isWall(e.x,e.y+my))e.y+=my;
+  }else if(e.attackCool<=0){
+   player.hp-=8;
+   e.attackCool=.55;
+   showHitDirection(e);
+ }
+ }
+ hud();
+ if(!won&&Math.hypot(player.x-29.5,player.y-29.5)<.65){
+  won=true;gameOver=true;
+  if(document.pointerLockElement===canvas)document.exitPointerLock();
+  title.textContent='🎉 YOU FOUND THE EXIT! 🎉';
+  sub.innerHTML='Maze complete!<br><br>Press ENTER to play again.';
+  menu.style.display='flex';
+ }
+ if(player.hp<=0&&!won){
+  gameOver=true;
+  if(document.pointerLockElement===canvas)document.exitPointerLock();
+  title.textContent='GAME OVER';
+  sub.innerHTML='Kills: '+player.kills+'<br><br>Press ENTER to restart.';
+  menu.style.display='flex';
+ }
+}
+function render(){
+ const viewFov=aiming?AIM_FOV:BASE_FOV;
+ const horizon=H/2+(thirdPerson?pitch:0);
+ const bg=ctx.createLinearGradient(0,0,0,H);
+ bg.addColorStop(0,'#83d9ff');bg.addColorStop(.499,'#dff7ff');bg.addColorStop(.5,'#82c96b');bg.addColorStop(1,'#4e9e4d');
+ ctx.fillStyle=bg;ctx.fillRect(0,0,W,H);
+ // Repaint sky/floor around the movable third-person horizon.
+ if(thirdPerson){
+  ctx.fillStyle='#bdefff';ctx.fillRect(0,0,W,Math.max(0,horizon));
+  ctx.fillStyle='#5fa652';ctx.fillRect(0,Math.max(0,horizon),W,H-Math.max(0,horizon));
+ }
+ const z=new Float32Array(Math.ceil(W)+2);
+ const count=Math.min(4096,Math.ceil(W));
+ if(wasm){for(let i=0;i<count;i++){const a=player.a-viewFov/2+(i/W)*viewFov;wasmDirs[i*2]=Math.cos(a);wasmDirs[i*2+1]=Math.sin(a);}wasm.trace(player.x,player.y,count,MAP[0].length,MAP.length,MAX_DIST);}
+ let prevWallD=MAX_DIST;
+ for(let sx=0;sx<W;sx+=1){
+  const a=player.a-viewFov/2+(sx/W)*viewFov,d=(wasm&&sx<count?wasmOut[Math.floor(sx)]:castRay(a))*Math.cos(a-player.a);
+  z[Math.floor(sx)]=d;
+  const wallH=Math.min(H*1.9,H*1.3/Math.max(.04,d));
+  const corrected=d/Math.max(.001,Math.cos(a-player.a));
+  const wx=player.x+Math.cos(a)*corrected;
+  const wy=player.y+Math.sin(a)*corrected;
+  const top=horizon-wallH/2;
+  const depth=Math.max(0,Math.min(1,d/24));
+
+  // Figure out which wall face the ray hit. Side faces are shaded differently,
+  // making corners and turns much easier to read.
+  const hitX=Math.abs(wx-Math.round(wx)) < Math.abs(wy-Math.round(wy));
+  const hitFrac=hitX ? wy-Math.floor(wy) : wx-Math.floor(wx);
+  const faceShade=hitX ? 0 : 18;
+
+  // Higher-contrast brick color with stronger distance shading.
+  const rr=Math.max(95,Math.round(226-depth*92-faceShade));
+  const gg=Math.max(62,Math.round(153-depth*72-faceShade*.65));
+  const bb=Math.max(48,Math.round(112-depth*54-faceShade*.45));
+  ctx.fillStyle=`rgb(${rr},${gg},${bb})`;
+  ctx.fillRect(sx,top,1,wallH);
+
+  // Dark mortar + a tiny bright lower highlight gives each brick a crisp edge.
+  const rows=6;
+  const mortar=Math.max(1,Math.min(5,wallH*.014));
+  for(let row=1;row<rows;row++){
+    const yy=top+wallH*row/rows;
+    ctx.fillStyle='rgba(75,44,32,.72)';
+    ctx.fillRect(sx,yy,1,mortar);
+    if(wallH>80){
+      ctx.fillStyle='rgba(255,225,190,.34)';
+      ctx.fillRect(sx,yy+mortar,1,Math.max(1,mortar*.35));
+    }
+  }
+
+  // Stronger staggered vertical brick seams.
+  for(let row=0;row<rows;row++){
+    const offset=(row%2)*.5;
+    const phase=(hitFrac*4+offset)%1;
+    if(phase<.075){
+      const y1=top+wallH*row/rows;
+      ctx.fillStyle='rgba(72,42,30,.68)';
+      ctx.fillRect(sx,y1,1,wallH/rows);
+    }
+  }
+
+  // Emphasize corners whenever adjacent ray depths change suddenly.
+  if(Math.abs(d-prevWallD)>.22){
+    ctx.fillStyle='rgba(45,28,22,.66)';
+    ctx.fillRect(sx,top,Math.min(4,W-sx),wallH);
+  }
+  prevWallD=d;
+ }
+ // Bright EXIT marker at the far end of the maze.
+ const gx=29.5,gy=29.5,gdx=gx-player.x,gdy=gy-player.y,gd=Math.hypot(gdx,gdy);
+ let ga=Math.atan2(gdy,gdx)-player.a;ga=Math.atan2(Math.sin(ga),Math.cos(ga));
+ if(Math.abs(ga)<viewFov*.72){
+  const gsx=W/2+(ga/(viewFov/2))*W/2,gsize=Math.min(H*.9,480/Math.max(.2,gd));
+  const gzi=Math.max(0,Math.min(W-1,Math.floor(gsx)));
+  if(gd<(z[gzi]||MAX_DIST)+.3){
+   ctx.fillStyle='#65ff78';ctx.fillRect(gsx-gsize*.32,horizon-gsize*.55,gsize*.64,gsize*1.1);
+   ctx.fillStyle='#eaff75';ctx.fillRect(gsx-gsize*.20,horizon-gsize*.43,gsize*.40,gsize*.86);
+   ctx.fillStyle='#164b20';ctx.font=Math.max(12,gsize*.16)+'px Arial';ctx.textAlign='center';ctx.fillText('EXIT',gsx,horizon);
+  }
+ }
+ const sprites=enemies.map(e=>{
+  const dx=e.x-player.x,dy=e.y-player.y,d=Math.hypot(dx,dy);
+  let a=Math.atan2(dy,dx)-player.a;a=Math.atan2(Math.sin(a),Math.cos(a));return{e,d,a};
+ }).sort((a,b)=>b.d-a.d);
+ for(const s of sprites){
+  if(Math.abs(s.a)>viewFov*.72)continue;
+  const sx=W/2+(s.a/(viewFov/2))*W/2,size=Math.min(H,400/s.d),zi=Math.max(0,Math.min(W-1,Math.floor(sx)));
+  if(s.d>(z[zi]||MAX_DIST)+.25)continue;
+  const l=sx-size/2,t=horizon-size*.48;
+  // Watermelon enemy
+  const cx=l+size*.5,cy=t+size*.5,r=size*.32;
+  ctx.save();
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.clip();
+  ctx.fillStyle=s.e.hit?'#ffffff':'#35a853';ctx.fillRect(cx-r,cy-r,r*2,r*2);
+  // dark watermelon rind stripes
+  ctx.strokeStyle=s.e.hit?'#dddddd':'#176d36';ctx.lineWidth=Math.max(2,size*.035);
+  for(let k=-2;k<=2;k++){
+   ctx.beginPath();
+   ctx.moveTo(cx+k*r*.38-r*.18,cy-r);
+   ctx.bezierCurveTo(cx+k*r*.28+r*.16,cy-r*.35,cx+k*r*.28-r*.16,cy+r*.35,cx+k*r*.38+r*.18,cy+r);
+   ctx.stroke();
+  }
+  ctx.restore();
+  // rind outline
+  ctx.strokeStyle='#124f2a';ctx.lineWidth=Math.max(2,size*.025);ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.stroke();
+  // angry cartoon face
+  ctx.strokeStyle='#111';ctx.lineWidth=Math.max(2,size*.028);
+  ctx.beginPath();ctx.moveTo(cx-r*.55,cy-r*.25);ctx.lineTo(cx-r*.18,cy-r*.10);ctx.moveTo(cx+r*.55,cy-r*.25);ctx.lineTo(cx+r*.18,cy-r*.10);ctx.stroke();
+  ctx.fillStyle='#111';ctx.beginPath();ctx.arc(cx-r*.28,cy-r*.02,r*.09,0,Math.PI*2);ctx.arc(cx+r*.28,cy-r*.02,r*.09,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(cx,cy+r*.30,r*.24,Math.PI*1.12,Math.PI*1.88);ctx.stroke();
+  // tiny arms and legs
+  ctx.strokeStyle='#174d2b';ctx.lineWidth=Math.max(3,size*.045);
+  ctx.beginPath();ctx.moveTo(cx-r*.85,cy+r*.08);ctx.lineTo(cx-r*1.18,cy+r*.35);ctx.moveTo(cx+r*.85,cy+r*.08);ctx.lineTo(cx+r*1.18,cy+r*.35);
+  ctx.moveTo(cx-r*.30,cy+r*.88);ctx.lineTo(cx-r*.42,cy+r*1.18);ctx.moveTo(cx+r*.30,cy+r*.88);ctx.lineTo(cx+r*.42,cy+r*1.18);ctx.stroke();
+
+  // Target-lock indicator around the selected watermelon.
+  if(aiming&&s.e===lockedTarget){
+   const lr=r*1.38;
+   ctx.strokeStyle='#ffd84a';
+   ctx.lineWidth=Math.max(3,size*.025);
+   ctx.beginPath();ctx.arc(cx,cy,lr,0,Math.PI*2);ctx.stroke();
+   ctx.fillStyle='#ffd84a';
+   ctx.font=`bold ${Math.max(12,Math.min(22,size*.12))}px system-ui`;
+   ctx.textAlign='center';
+   ctx.fillText('LOCK',cx,cy-lr-8);
+   ctx.textAlign='start';
+  }
+ }
+ if(thirdPerson){
+  // Third-person player avatar: bright blue explorer, centered below the crosshair.
+  const bob=(keys.KeyW||keys.KeyA||keys.KeyS||keys.KeyD)?Math.sin(performance.now()*.012)*3:0;
+  const cx=W/2, base=H*.88+bob, s=Math.max(86,Math.min(145,H*.20));
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,.20)';ctx.beginPath();ctx.ellipse(cx,base+s*.52,s*.42,s*.12,0,0,Math.PI*2);ctx.fill();
+  // legs
+  ctx.fillStyle='#263a66';ctx.fillRect(cx-s*.27,base+s*.10,s*.20,s*.40);ctx.fillRect(cx+s*.07,base+s*.10,s*.20,s*.40);
+  // body
+  ctx.fillStyle='#3c91e6';ctx.fillRect(cx-s*.34,base-s*.43,s*.68,s*.62);
+  // head
+  ctx.fillStyle='#f1c7a5';ctx.beginPath();ctx.arc(cx,base-s*.62,s*.27,0,Math.PI*2);ctx.fill();
+  // cap
+  ctx.fillStyle='#ffd34d';ctx.fillRect(cx-s*.28,base-s*.88,s*.56,s*.16);ctx.fillRect(cx+s*.15,base-s*.75,s*.25,s*.08);
+  // arms + blaster
+  ctx.fillStyle='#f1c7a5';ctx.fillRect(cx+s*.28,base-s*.35,s*.18,s*.36);
+  ctx.fillStyle='#343941';ctx.fillRect(cx+s*.34,base-s*.37,s*.62,s*.15);
+  ctx.fillStyle='#111820';ctx.fillRect(cx+s*.82,base-s*.35,s*.27,s*.10);
+ } else {
+ ctx.fillStyle='#343941';ctx.fillRect(W*.63,H*.73,W*.25,H*.27);
+ ctx.fillStyle='#5d646e';ctx.fillRect(W*.67,H*.68,W*.18,H*.11);
+ ctx.fillStyle='#15171b';ctx.fillRect(W*.78,H*.70,W*.14,H*.052);
+ if(muzzle>0){
+  ctx.fillStyle='#ffd75e';ctx.beginPath();
+  if(thirdPerson){
+    ctx.moveTo(W/2+55,H*.75);ctx.lineTo(W/2+82,H*.72);ctx.lineTo(W/2+66,H*.77);ctx.lineTo(W/2+82,H*.81);ctx.lineTo(W/2+54,H*.79);
+  }else{
+    ctx.moveTo(W*.92,H*.71);ctx.lineTo(W*.99,H*.66);ctx.lineTo(W*.95,H*.74);ctx.lineTo(W*.99,H*.79);ctx.lineTo(W*.92,H*.77);
+  }
+  ctx.fill();
+}
+ }
+
+ // MINIMAP — top right.
+ // YOU stay in the center pointing UP; the maze rotates underneath you.
+ {
+  const mapSize=Math.max(160,Math.min(230,W*.20));
+  const pad=18;
+  const mx=W-mapSize-pad,my=pad;
+
+  // Show a local area around the player instead of the entire maze.
+  const visibleCells=11;
+  const cell=mapSize/visibleCells;
+  const half=visibleCells/2;
+
+  // Convert a world position to the moving minimap.
+  const mapX=wx=>mx+mapSize/2+(wx-player.x)*cell;
+  const mapY=wy=>my+mapSize/2+(wy-player.y)*cell;
+
+  // background + border
+  ctx.fillStyle='rgba(247,250,252,.94)';
+  ctx.fillRect(mx-7,my-7,mapSize+14,mapSize+14);
+  ctx.strokeStyle='rgba(25,45,60,.9)';
+  ctx.lineWidth=3;
+  ctx.strokeRect(mx-7,my-7,mapSize+14,mapSize+14);
+
+  // Everything except the label/player is clipped inside the minimap.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(mx,my,mapSize,mapSize);
+  ctx.clip();
+
+  // Fill the entire clipped square before rotating, including the corners.
+  ctx.fillStyle='#d9e0e5';
+  ctx.fillRect(mx,my,mapSize,mapSize);
+
+  // Rotate the world around the fixed blue player arrow.
+  // World angle 0 faces right; on this minimap forward is always UP.
+  const centerX=mx+mapSize/2,centerY=my+mapSize/2;
+  ctx.translate(centerX,centerY);
+  ctx.rotate(-Math.PI/2-player.a);
+  ctx.translate(-centerX,-centerY);
+
+  // Cover the entire rotated viewport (including its four corners).
+  const reach=half*Math.SQRT2+2;
+  const minGX=Math.floor(player.x-reach);
+  const maxGX=Math.ceil(player.x+reach);
+  const minGY=Math.floor(player.y-reach);
+  const maxGY=Math.ceil(player.y+reach);
+
+  for(let yy=minGY;yy<=maxGY;yy++){
+   for(let xx=minGX;xx<=maxGX;xx++){
+    const sx=mapX(xx),sy=mapY(yy);
+    if(yy>=0&&yy<MAP.length&&xx>=0&&xx<MAP[0].length){
+     if(MAP[yy][xx]==='1'){
+      ctx.fillStyle='#9b5d45';
+      ctx.fillRect(sx,sy,Math.ceil(cell+.7),Math.ceil(cell+.7));
+      // tiny mortar hint so nearby walls are easier to read
+      ctx.strokeStyle='rgba(255,235,210,.42)';
+      ctx.lineWidth=1;
+      ctx.strokeRect(sx+.5,sy+.5,Math.max(0,cell-1),Math.max(0,cell-1));
+     }else{
+      ctx.fillStyle='#f7f3ea';
+      ctx.fillRect(sx,sy,Math.ceil(cell+.7),Math.ceil(cell+.7));
+     }
+    }
+   }
+  }
+
+  // Exit moves with the map.
+  const exitX=29.5,exitY=29.5;
+  const exitPX=mapX(exitX),exitPY=mapY(exitY);
+  {
+   ctx.fillStyle='#19c943';
+   ctx.beginPath();
+   ctx.arc(exitPX,exitPY,Math.max(6,cell*.28),0,Math.PI*2);
+   ctx.fill();
+   ctx.strokeStyle='#ffffff';
+   ctx.lineWidth=2;
+   ctx.stroke();
+  }
+
+  // Watermelons move with the map.
+  for(const enemy of enemies){
+   const ex=mapX(enemy.x),ey=mapY(enemy.y);
+   const er=Math.max(5,cell*.22);
+   ctx.fillStyle='#e53935';
+   ctx.beginPath();
+   ctx.arc(ex,ey,er,0,Math.PI*2);
+   ctx.fill();
+   ctx.strokeStyle=enemy===lockedTarget?'#ffd84a':'#ffffff';
+   ctx.lineWidth=enemy===lockedTarget?3:1.5;
+   ctx.stroke();
+  }
+
+  ctx.restore();
+
+  // YOU NEVER MOVE ON THE MINIMAP — always centered.
+  const px=mx+mapSize/2,py=my+mapSize/2;
+  const arrow=Math.max(10,cell*.48);
+  ctx.save();
+  ctx.translate(px,py);
+  ctx.rotate(-Math.PI/2); // Fixed forward-facing blue arrow
+  ctx.fillStyle='#1677ff';
+  ctx.beginPath();
+  ctx.moveTo(arrow,0);
+  ctx.lineTo(-arrow*.68,-arrow*.60);
+  ctx.lineTo(-arrow*.68,arrow*.60);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle='#ffffff';
+  ctx.lineWidth=2.5;
+  ctx.stroke();
+  ctx.restore();
+
+  // Center reticle makes it obvious the map follows YOU.
+  ctx.strokeStyle='rgba(22,119,255,.25)';
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.arc(px,py,arrow*1.7,0,Math.PI*2);
+  ctx.stroke();
+
+  ctx.fillStyle='#17324a';
+  ctx.font='bold 11px Arial';
+  ctx.textAlign='left';
+  ctx.fillText('UP = FORWARD   🔴 ENEMY   🟢 EXIT',mx,my-10);
+ }
+ const cy=thirdPerson?horizon:H/2;
+ const targetLocked=aiming&&lockedTarget;
+ const arm=targetLocked?7:(aiming?8:11),gap=targetLocked?2:(aiming?3:5);
+ ctx.strokeStyle=targetLocked?'#ffd84a':(aiming?'#b9ffd5':'#ffffff');
+ ctx.lineWidth=aiming?1.5:2;
+ ctx.beginPath();
+ ctx.moveTo(W/2-arm,cy);ctx.lineTo(W/2-gap,cy);ctx.moveTo(W/2+gap,cy);ctx.lineTo(W/2+arm,cy);
+ ctx.moveTo(W/2,cy-arm);ctx.lineTo(W/2,cy-gap);ctx.moveTo(W/2,cy+gap);ctx.lineTo(W/2,cy+arm);ctx.stroke();
+ ctx.fillStyle=targetLocked?'#ffd84a':(aiming?'#78ffad':'#ffffff');
+ ctx.beginPath();ctx.arc(W/2,cy,aiming?1.8:2.2,0,Math.PI*2);ctx.fill();
+}
+function lockMouse(){
+ if(gameOver)return;
+ canvas.focus();
+ const promise=canvas.requestPointerLock({unadjustedMovement:false});
+ if(promise&&promise.catch)promise.catch(()=>canvas.requestPointerLock());
+}
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+canvas.addEventListener('mousedown',e=>{
+ if(e.button===2){
+  if(document.pointerLockElement===canvas&&!gameOver){
+   aiming=true;
+   lockedTarget=findLockTarget();
+   status.textContent=lockedTarget?'🔒 WATERMELON LOCKED — A/D to strafe':'🎯 LOCK-ON SEARCHING — face a watermelon';
+  }
+  return;
+ }
+ if(e.button!==0)return;
+ if(document.pointerLockElement!==canvas)lockMouse();else shoot();
+});
+document.addEventListener('mouseup',e=>{
+ if(e.button===2){
+  aiming=false;lockedTarget=null;
+  if(document.pointerLockElement===canvas&&!gameOver)status.textContent='🔒 CURSOR LOCKED — ESC unlocks it';
+ }
+});
+document.addEventListener('pointerlockchange',()=>{
+ const locked=document.pointerLockElement===canvas;
+ if(locked){menu.style.display='none';status.textContent='🔒 CURSOR LOCKED — ESC unlocks it';canvas.focus()}
+ else if(!gameOver){aiming=false;lockedTarget=null;title.textContent='PAUSED';sub.innerHTML='Click anywhere to lock the cursor again.<br><br>WASD • Mouse look • Click shoot • Hold RIGHT CLICK LOCK ON • A/D strafe • R reload • V switch view';menu.style.display='flex';status.textContent='Cursor unlocked — click the game to resume';keys={}}
+});
+document.addEventListener('pointerlockerror',()=>{status.textContent='Pointer lock was refused by this browser tab. Open this downloaded HTML directly in Chrome or Safari.'});
+document.addEventListener('mousemove',e=>{
+ if(document.pointerLockElement===canvas&&!gameOver){
+  // Once locked, the camera tracks the target automatically.
+  // Without a target, right-click still acts as slower precision aim.
+  if(!(aiming&&lockedTarget)){
+   player.a+=e.movementX*(aiming?.00072:.00128);
+   if(thirdPerson){
+    pitch+=e.movementY*(aiming?.14:.22);
+    pitch=Math.max(-H*.18,Math.min(H*.18,pitch));
+   }
+  }
+ }
+});
+document.addEventListener('keydown',e=>{
+ keys[e.code]=true;
+ if(e.code==='KeyV'&&!e.repeat&&!gameOver){
+  thirdPerson=!thirdPerson;
+  viewModeEl.textContent=thirdPerson?'3RD PERSON':'1ST PERSON';
+  status.textContent=thirdPerson?'Third-person view':'First-person view';
+ }
+ if(e.code==='KeyR'&&!gameOver&&!reloading&&player.ammo<15){reloading=true;reloadTime=3;reloadOverlay.style.display='block';reloadOverlay.textContent='RELOADING... 3.0s';status.textContent='Reloading — 3 seconds'}
+ if(e.code==='Enter'&&gameOver){reset()}
+});
+document.addEventListener('keyup',e=>keys[e.code]=false);
+function loop(now){
+ const dt=Math.min(.035,(now-last)/1000||.016);last=now;
+ if(!gameOver&&document.pointerLockElement===canvas)update(dt);
+ render();present();requestAnimationFrame(loop);
+}
+if(!gl){document.getElementById('status').textContent='WebGL2 unavailable. Enable hardware acceleration in Chrome.';}reset();requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
